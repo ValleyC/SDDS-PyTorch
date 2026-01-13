@@ -1,9 +1,8 @@
 """
-PPO Trainer for SDDS-PyTorch.
+PPO Trainer for SDDS-PyTorch with permutation-based TSP.
 
 This implements Proximal Policy Optimization for training discrete diffusion
-models using reinforcement learning. The main SDDS contribution is the
-memory-efficient mini-batch processing over diffusion steps.
+models using reinforcement learning with the categorical position formulation.
 """
 
 import torch
@@ -17,7 +16,7 @@ from utils.moving_average import ExponentialMovingAverage
 
 class PPOTrainer(BaseTrainer):
     """
-    PPO Trainer for discrete diffusion models.
+    PPO Trainer for discrete diffusion models with categorical positions.
 
     Key features:
     - TD(lambda) advantage estimation
@@ -41,12 +40,15 @@ class PPOTrainer(BaseTrainer):
 
         Args:
             config: Configuration with PPO settings
-            model: Diffusion model
-            energy_class: Energy function for CO problem
-            noise_class: Noise distribution class
+            model: Diffusion model (outputs position logits)
+            energy_class: Energy function for TSP (permutation-based)
+            noise_class: Noise distribution class (categorical)
             device: Device to use
         """
         super().__init__(config, model, energy_class, noise_class, device)
+
+        # Get n_nodes for position representation
+        self.n_nodes = config.get("n_nodes", 20)
 
         # PPO parameters
         self.clip_value = config.get("clip_value", 0.2)
@@ -57,9 +59,9 @@ class PPOTrainer(BaseTrainer):
         self.n_inner_steps = config.get("n_inner_steps", 4)
 
         # Value network - simple MLP that takes state statistics as input
-        # Input: [edge_mean, edge_std, timestep_normalized, coord_stats]
+        # Input: [position distribution stats, timestep_normalized, coord_stats]
         value_input_dim = 8
-        hidden_dim = getattr(model, 'hidden_dim', 64)
+        hidden_dim = config.get("hidden_dim", 64)
         self.value_head = nn.Sequential(
             nn.Linear(value_input_dim, hidden_dim),
             nn.SiLU(),
@@ -89,18 +91,32 @@ class PPOTrainer(BaseTrainer):
 
         Args:
             coords: Node coordinates (B, N, 2)
-            x_t: Current edge state (B, N, N)
+            x_t: Current position assignments (B, N) with values 0 to N-1
             timestep: Current timestep (B,)
 
         Returns:
             Value estimate (B,)
         """
         B = coords.shape[0]
+        N = coords.shape[1]
 
-        # Extract state features
-        edge_mean = x_t.mean(dim=(1, 2))  # (B,)
-        edge_std = x_t.std(dim=(1, 2)) + 1e-8  # (B,)
-        edge_sum = x_t.sum(dim=(1, 2))  # (B,)
+        # Handle extra dimension
+        if x_t.dim() == 3:
+            x_t = x_t.squeeze(-1)
+
+        # Convert to one-hot to get distribution statistics
+        x_one_hot = F.one_hot(x_t.long(), num_classes=N).float()  # (B, N, N)
+
+        # Position distribution statistics
+        # Row sum tells us how many positions are assigned to each node (should be 1)
+        # Col sum tells us how many nodes are assigned to each position (should be 1)
+        row_sum = x_one_hot.sum(dim=2)  # (B, N)
+        col_sum = x_one_hot.sum(dim=1)  # (B, N)
+
+        row_violation = (row_sum - 1).abs().mean(dim=1)  # (B,)
+        col_violation = (col_sum - 1).abs().mean(dim=1)  # (B,)
+
+        # Timestep normalized
         t_norm = timestep.float() / self.n_diffusion_steps  # (B,)
 
         # Coordinate statistics
@@ -109,43 +125,14 @@ class PPOTrainer(BaseTrainer):
 
         # Concatenate features
         features = torch.stack([
-            edge_mean, edge_std, edge_sum / (x_t.shape[1] ** 2), t_norm,
+            row_violation, col_violation,
+            t_norm, t_norm ** 2,  # Quadratic time feature
             coord_mean[:, 0], coord_mean[:, 1],
             coord_std[:, 0], coord_std[:, 1]
         ], dim=1)  # (B, 8)
 
         value = self.value_head(features).squeeze(-1)
         return value
-
-    def _compute_log_prob(
-        self,
-        logits: torch.Tensor,
-        action: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute log probability of action given logits.
-
-        Args:
-            logits: Model output (B, N, N, 2)
-            action: Taken action (B, N, N)
-
-        Returns:
-            Log probability per sample (B,)
-        """
-        # Numerical stability
-        logits = torch.clamp(logits, min=-50, max=50)
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        # Get log probability of taken action
-        # action is binary: 0 or 1
-        log_p_action = torch.where(
-            action.unsqueeze(-1) == 1,
-            log_probs[..., 1:2],
-            log_probs[..., 0:1]
-        ).squeeze(-1)  # (B, N, N)
-
-        # Sum log probs over all edges for per-sample log prob
-        return log_p_action.sum(dim=(-2, -1))  # (B,)
 
     def _compute_entropy(
         self,
@@ -155,7 +142,7 @@ class PPOTrainer(BaseTrainer):
         Compute entropy of the policy.
 
         Args:
-            logits: Model output (B, N, N, 2)
+            logits: Model output (B, N, N_positions)
 
         Returns:
             Entropy per sample (B,)
@@ -164,11 +151,11 @@ class PPOTrainer(BaseTrainer):
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
 
-        # Entropy: -sum(p * log(p)) per edge
-        entropy_per_edge = -torch.sum(probs * log_probs, dim=-1)  # (B, N, N)
+        # Entropy: -sum(p * log(p)) per node
+        entropy_per_node = -torch.sum(probs * log_probs, dim=-1)  # (B, N)
 
-        # Sum over all edges for per-sample entropy
-        return entropy_per_edge.sum(dim=(-2, -1))  # (B,)
+        # Sum over all nodes for per-sample entropy
+        return entropy_per_node.sum(dim=-1)  # (B,)
 
     def sample(
         self,
@@ -199,9 +186,9 @@ class PPOTrainer(BaseTrainer):
         coords_exp = coords.unsqueeze(1).expand(-1, n_samples, -1, -1)
         coords_flat = coords_exp.reshape(batch_size * n_samples, n_nodes, 2)
 
-        # Sample prior
-        x_t = self.model.sample_prior(
-            (batch_size * n_samples, n_nodes, n_nodes),
+        # Sample prior (uniform random positions)
+        x_t = self.noise_class.sample_prior(
+            (batch_size * n_samples, n_nodes),
             device=self.device,
             generator=key
         )
@@ -217,15 +204,13 @@ class PPOTrainer(BaseTrainer):
             with torch.no_grad():
                 logits = self.model(coords_flat, x_t, timestep)
 
-            # Use corrected noise schedule index:
-            # In reverse diffusion, t=T-1 is most noisy (start), t=0 is cleanest (end)
-            # noise_t_idx maps to beta_arr where index 0 = most noisy
+            # Use corrected noise schedule index
             noise_t_idx = T - 1 - t
             x_prev, _ = self.noise_class.calc_noise_step(logits, x_t, noise_t_idx, key)
             x_t = x_prev
 
-        # Reshape
-        x_0 = x_t.reshape(batch_size, n_samples, n_nodes, n_nodes)
+        # Reshape: x_0 is (batch_size * n_samples, n_nodes) position indices
+        x_0 = x_t.reshape(batch_size, n_samples, n_nodes)
 
         # Compute energies
         energies = []
@@ -273,16 +258,22 @@ class PPOTrainer(BaseTrainer):
         T = self.n_diffusion_steps
         B = batch_size * n_samples
 
-        # Storage
-        states = torch.zeros(T, B, n_nodes, n_nodes, device=self.device)
+        # Get n_random_features from model (default 5)
+        n_random_features = getattr(self.model, 'n_random_features',
+                                    getattr(self.model.model, 'n_random_features', 5))
+
+        # Storage - states are now (T, B, n_nodes) position indices
+        states = torch.zeros(T, B, n_nodes, dtype=torch.long, device=self.device)
         actions = torch.zeros_like(states)
         log_probs = torch.zeros(T, B, device=self.device)
         values = torch.zeros(T + 1, B, device=self.device)
         rewards = torch.zeros(T, B, device=self.device)
         entropies = torch.zeros(T, B, device=self.device)
+        # IMPORTANT: Cache random features for PPO consistency
+        rand_features_all = torch.zeros(T, B, n_nodes, n_random_features, device=self.device)
 
-        # Sample prior
-        x_t = self.model.sample_prior((B, n_nodes, n_nodes), device=self.device, generator=key)
+        # Sample prior (uniform random positions)
+        x_t = self.noise_class.sample_prior((B, n_nodes), device=self.device, generator=key)
 
         # Run reverse diffusion
         for t in range(T - 1, -1, -1):
@@ -291,9 +282,13 @@ class PPOTrainer(BaseTrainer):
 
             states[step_idx] = x_t
 
+            # Generate and cache random features for this step
+            rand_features = torch.rand(B, n_nodes, n_random_features, device=self.device)
+            rand_features_all[step_idx] = rand_features
+
             # Get model prediction (no grad for rollout collection)
             with torch.no_grad():
-                logits = self.model(coords_flat, x_t, timestep)
+                logits = self.model(coords_flat, x_t, timestep, rand_features=rand_features)
 
                 # Compute value estimate
                 values[step_idx] = self._get_value(coords_flat, x_t, timestep)
@@ -304,12 +299,8 @@ class PPOTrainer(BaseTrainer):
 
             actions[step_idx] = x_prev
 
-            # Use log prob from calc_noise_step (computed from posterior p_sample)
-            # Sum over remaining dimensions to get per-sample log prob
-            if action_log_prob.dim() > 1:
-                log_probs[step_idx] = action_log_prob.sum(dim=-1)
-            else:
-                log_probs[step_idx] = action_log_prob
+            # Use log prob from calc_noise_step
+            log_probs[step_idx] = action_log_prob
 
             # Compute entropy
             entropies[step_idx] = self._compute_entropy(logits)
@@ -325,8 +316,8 @@ class PPOTrainer(BaseTrainer):
             timestep_final = torch.zeros(B, device=self.device, dtype=torch.long)
             values[T] = self._get_value(coords_flat, x_t, timestep_final)
 
-        # Terminal reward (negative energy)
-        x_0 = x_t.reshape(batch_size, n_samples, n_nodes, n_nodes)
+        # Terminal reward (negative energy, normalized)
+        x_0 = x_t.reshape(batch_size, n_samples, n_nodes)
 
         terminal_energies = []
         for s in range(n_samples):
@@ -334,9 +325,15 @@ class PPOTrainer(BaseTrainer):
             terminal_energies.append(energy)
             start_idx = s * batch_size
             end_idx = (s + 1) * batch_size
-            rewards[-1, start_idx:end_idx] -= energy
+            # Normalize energy reward
+            normalized_energy = energy / n_nodes
+            rewards[-1, start_idx:end_idx] -= normalized_energy
 
         terminal_energies = torch.stack(terminal_energies, dim=1)
+
+        # Update moving average for tracking
+        batch_reward_mean = rewards[-1].mean().item()
+        self.moving_average.update(batch_reward_mean)
 
         return {
             "states": states,
@@ -346,6 +343,7 @@ class PPOTrainer(BaseTrainer):
             "rewards": rewards,
             "entropies": entropies,
             "coords": coords_flat,
+            "rand_features": rand_features_all,  # Cached for PPO optimization
             "x_0": x_0,
             "terminal_energies": terminal_energies,
         }
@@ -479,11 +477,15 @@ class PPOTrainer(BaseTrainer):
                     (rollout["coords"].shape[0],), t, device=self.device, dtype=torch.long
                 )
 
-                # Forward pass (with gradients)
-                logits = self.model(rollout["coords"], rollout["states"][step_idx], timestep)
+                # Forward pass (with gradients) - IMPORTANT: use cached rand_features
+                logits = self.model(
+                    rollout["coords"],
+                    rollout["states"][step_idx],
+                    timestep,
+                    rand_features=rollout["rand_features"][step_idx]
+                )
 
                 # Compute new log prob using same posterior distribution as sampling
-                # noise_t_idx maps t to the correct noise schedule index
                 noise_t_idx = T - 1 - t
                 log_prob = self.noise_class.compute_action_log_prob(
                     logits,

@@ -1,5 +1,5 @@
 """
-Integration tests for SDDS-PyTorch.
+Integration tests for SDDS-PyTorch with permutation matrix formulation.
 
 Tests the full pipeline: model + noise + energy + trainer.
 """
@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Networks import DiffusionModelDense
-from NoiseDistributions import BernoulliNoise
+from NoiseDistributions import CategoricalNoise
 from EnergyFunctions import TSPEnergyClass
 from Trainers import PPOTrainer
 from Data import get_tsp_dataloader
@@ -22,11 +22,13 @@ def test_full_pipeline_initialization():
     """Test that all components can be initialized together."""
     print("Testing full pipeline initialization...")
 
+    n_nodes = 10
+
     config = {
-        "n_nodes": 10,
+        "n_nodes": n_nodes,
         "n_diffusion_steps": 5,
         "diff_schedule": "DiffUCO",
-        "n_bernoulli_features": 2,
+        "n_bernoulli_features": n_nodes,  # Categorical over N positions
         "n_layers": 2,
         "hidden_dim": 32,
         "node_dim": 32,
@@ -45,8 +47,9 @@ def test_full_pipeline_initialization():
 
     device = torch.device("cpu")
 
-    # Create model
+    # Create model - now requires n_nodes for categorical output
     model = DiffusionModelDense(
+        n_nodes=config["n_nodes"],
         n_layers=config["n_layers"],
         hidden_dim=config["hidden_dim"],
         node_dim=config["node_dim"],
@@ -55,7 +58,7 @@ def test_full_pipeline_initialization():
     )
 
     # Create noise distribution
-    noise_class = BernoulliNoise(config)
+    noise_class = CategoricalNoise(config)
 
     # Create energy function
     energy_class = TSPEnergyClass(config)
@@ -77,11 +80,13 @@ def test_forward_pass():
     """Test a forward pass through the model."""
     print("\nTesting forward pass...")
 
+    n_nodes = 10
+
     config = {
-        "n_nodes": 10,
+        "n_nodes": n_nodes,
         "n_diffusion_steps": 5,
         "diff_schedule": "DiffUCO",
-        "n_bernoulli_features": 2,
+        "n_bernoulli_features": n_nodes,
         "n_layers": 2,
         "hidden_dim": 32,
         "node_dim": 32,
@@ -100,10 +105,10 @@ def test_forward_pass():
 
     device = torch.device("cpu")
     batch_size = 4
-    n_nodes = 10
 
     # Create model
     model = DiffusionModelDense(
+        n_nodes=config["n_nodes"],
         n_layers=config["n_layers"],
         hidden_dim=config["hidden_dim"],
         node_dim=config["node_dim"],
@@ -111,16 +116,16 @@ def test_forward_pass():
         time_dim=config["time_dim"],
     )
 
-    # Create inputs
+    # Create inputs - positions instead of adjacency matrix
     coords = torch.rand(batch_size, n_nodes, 2)
-    adj_matrix = torch.rand(batch_size, n_nodes, n_nodes)
+    positions = torch.randint(0, n_nodes, (batch_size, n_nodes))  # Position indices
     timesteps = torch.randint(0, 5, (batch_size,))
 
     # Forward pass
-    logits = model(coords, adj_matrix, timesteps)
+    logits = model(coords, positions, timesteps)
 
-    # Model outputs (batch, n_nodes, n_nodes, 2) for binary edge classification
-    expected_shape = (batch_size, n_nodes, n_nodes, 2)
+    # Model outputs (batch, n_nodes, n_positions) for categorical position classification
+    expected_shape = (batch_size, n_nodes, n_nodes)
     assert logits.shape == expected_shape, f"Expected {expected_shape}, got {logits.shape}"
 
     print(f"  Output shape: {logits.shape} [PASS]")
@@ -151,11 +156,13 @@ def test_single_train_step():
     """Test a single training step."""
     print("\nTesting single train step...")
 
+    n_nodes = 10
+
     config = {
-        "n_nodes": 10,
+        "n_nodes": n_nodes,
         "n_diffusion_steps": 3,
         "diff_schedule": "DiffUCO",
-        "n_bernoulli_features": 2,
+        "n_bernoulli_features": n_nodes,
         "n_layers": 2,
         "hidden_dim": 32,
         "node_dim": 32,
@@ -176,6 +183,7 @@ def test_single_train_step():
 
     # Create components
     model = DiffusionModelDense(
+        n_nodes=config["n_nodes"],
         n_layers=config["n_layers"],
         hidden_dim=config["hidden_dim"],
         node_dim=config["node_dim"],
@@ -183,7 +191,7 @@ def test_single_train_step():
         time_dim=config["time_dim"],
     )
 
-    noise_class = BernoulliNoise(config)
+    noise_class = CategoricalNoise(config)
     energy_class = TSPEnergyClass(config)
 
     trainer = PPOTrainer(
@@ -195,7 +203,7 @@ def test_single_train_step():
     )
 
     # Create batch
-    batch = {"coords": torch.rand(4, 10, 2)}
+    batch = {"coords": torch.rand(4, n_nodes, 2)}
 
     # Run train step
     loss, metrics = trainer.train_step(batch)
@@ -212,11 +220,13 @@ def test_sampling():
     """Test sampling from the model."""
     print("\nTesting sampling...")
 
+    n_nodes = 10
+
     config = {
-        "n_nodes": 10,
+        "n_nodes": n_nodes,
         "n_diffusion_steps": 3,
         "diff_schedule": "DiffUCO",
-        "n_bernoulli_features": 2,
+        "n_bernoulli_features": n_nodes,
         "n_layers": 2,
         "hidden_dim": 32,
         "node_dim": 32,
@@ -237,6 +247,7 @@ def test_sampling():
 
     # Create components
     model = DiffusionModelDense(
+        n_nodes=config["n_nodes"],
         n_layers=config["n_layers"],
         hidden_dim=config["hidden_dim"],
         node_dim=config["node_dim"],
@@ -244,7 +255,7 @@ def test_sampling():
         time_dim=config["time_dim"],
     )
 
-    noise_class = BernoulliNoise(config)
+    noise_class = CategoricalNoise(config)
     energy_class = TSPEnergyClass(config)
 
     trainer = PPOTrainer(
@@ -256,7 +267,7 @@ def test_sampling():
     )
 
     # Sample
-    coords = torch.rand(2, 10, 2)
+    coords = torch.rand(2, n_nodes, 2)
 
     trainer.model.eval()
     with torch.no_grad():
@@ -266,6 +277,7 @@ def test_sampling():
     assert "energies" in result, "Result should contain 'energies'"
     assert "best_energy" in result, "Result should contain 'best_energy'"
 
+    # x_0 should be position indices: (batch, n_samples, n_nodes)
     print(f"  Samples shape: {result['x_0'].shape} [PASS]")
     print(f"  Best energies: {result['best_energy'].tolist()} [PASS]")
     return True
@@ -277,11 +289,13 @@ def test_checkpoint_save_load():
 
     import tempfile
 
+    n_nodes = 10
+
     config = {
-        "n_nodes": 10,
+        "n_nodes": n_nodes,
         "n_diffusion_steps": 3,
         "diff_schedule": "DiffUCO",
-        "n_bernoulli_features": 2,
+        "n_bernoulli_features": n_nodes,
         "n_layers": 2,
         "hidden_dim": 32,
         "node_dim": 32,
@@ -302,6 +316,7 @@ def test_checkpoint_save_load():
 
     # Create trainer
     model = DiffusionModelDense(
+        n_nodes=config["n_nodes"],
         n_layers=config["n_layers"],
         hidden_dim=config["hidden_dim"],
         node_dim=config["node_dim"],
@@ -309,7 +324,7 @@ def test_checkpoint_save_load():
         time_dim=config["time_dim"],
     )
 
-    noise_class = BernoulliNoise(config)
+    noise_class = CategoricalNoise(config)
     energy_class = TSPEnergyClass(config)
 
     trainer = PPOTrainer(
@@ -339,16 +354,57 @@ def test_checkpoint_save_load():
     return True
 
 
+def test_noise_distribution():
+    """Test noise distribution with categorical positions."""
+    print("\nTesting noise distribution (categorical)...")
+
+    n_nodes = 10
+
+    config = {
+        "n_nodes": n_nodes,
+        "n_diffusion_steps": 5,
+        "diff_schedule": "DiffUCO",
+        "n_bernoulli_features": n_nodes,
+    }
+
+    noise_class = CategoricalNoise(config)
+
+    # Test prior sampling
+    batch_size = 4
+    prior = noise_class.sample_prior((batch_size, n_nodes), torch.device("cpu"))
+
+    assert prior.shape == (batch_size, n_nodes), f"Expected ({batch_size}, {n_nodes}), got {prior.shape}"
+    assert torch.all(prior >= 0) and torch.all(prior < n_nodes), "Prior should be valid positions"
+
+    print(f"  Prior shape: {prior.shape} [PASS]")
+    print(f"  Prior range: [{prior.min().item()}, {prior.max().item()}] [PASS]")
+
+    # Test noise step
+    logits = torch.randn(batch_size, n_nodes, n_nodes)  # Model output
+    X_t = torch.randint(0, n_nodes, (batch_size, n_nodes))  # Current positions
+    t_idx = torch.tensor([3, 3, 3, 3])  # Timestep indices
+
+    X_prev, log_prob = noise_class.calc_noise_step(logits, X_t, t_idx)
+
+    assert X_prev.shape == (batch_size, n_nodes), f"Expected ({batch_size}, {n_nodes}), got {X_prev.shape}"
+    assert log_prob.shape == (batch_size, n_nodes), f"Wrong log_prob shape: {log_prob.shape}"
+
+    print(f"  Noise step output shape: {X_prev.shape} [PASS]")
+    print("  Noise distribution test passed!")
+    return True
+
+
 def run_all_tests():
     """Run all integration tests."""
     print("=" * 50)
-    print("Running Integration Tests")
+    print("Running Integration Tests (Permutation Formulation)")
     print("=" * 50)
 
     tests = [
         test_full_pipeline_initialization,
         test_forward_pass,
         test_dataloader,
+        test_noise_distribution,
         test_single_train_step,
         test_sampling,
         test_checkpoint_save_load,

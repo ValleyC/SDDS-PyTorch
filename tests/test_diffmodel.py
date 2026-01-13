@@ -1,5 +1,5 @@
 """
-Test DiffusionModel wrapper.
+Test DiffusionModel wrapper for categorical position output.
 """
 
 import torch
@@ -21,30 +21,30 @@ def test_diffusion_model_dense_forward():
     hidden_dim = 32
     n_layers = 2
 
-    # Create model
+    # Create model - now requires n_nodes for categorical output
     model = DiffusionModelDense(
+        n_nodes=n_nodes,
         n_layers=n_layers,
         hidden_dim=hidden_dim,
         node_dim=32,
         edge_dim=32,
         time_dim=32,
-        coord_dim=2,
-        out_channels=2
     )
 
     # Create dummy inputs
     coords = torch.rand(batch_size, n_nodes, 2)
-    adj_matrix = torch.rand(batch_size, n_nodes, n_nodes)  # Noisy edge values
+    # Position indices (each node has a position 0 to n_nodes-1)
+    positions = torch.randint(0, n_nodes, (batch_size, n_nodes))
     timesteps = torch.randint(0, 100, (batch_size,))
 
-    # Forward pass
-    edge_logits = model(coords, adj_matrix, timesteps)
+    # Forward pass - outputs position logits per node
+    position_logits = model(coords, positions, timesteps)
 
-    # Check output shape
-    expected_shape = (batch_size, n_nodes, n_nodes, 2)
-    assert edge_logits.shape == expected_shape, f"Expected {expected_shape}, got {edge_logits.shape}"
+    # Check output shape: (batch, n_nodes, n_positions)
+    expected_shape = (batch_size, n_nodes, n_nodes)
+    assert position_logits.shape == expected_shape, f"Expected {expected_shape}, got {position_logits.shape}"
 
-    print(f"  Output shape: {edge_logits.shape} [PASS]")
+    print(f"  Output shape: {position_logits.shape} [PASS]")
     print("  Dense forward pass test passed!")
     return True
 
@@ -57,6 +57,7 @@ def test_diffusion_model_sampling():
     n_nodes = 5
 
     model = DiffusionModelDense(
+        n_nodes=n_nodes,
         n_layers=1,
         hidden_dim=16,
         node_dim=16,
@@ -66,18 +67,21 @@ def test_diffusion_model_sampling():
 
     # Create inputs
     coords = torch.rand(batch_size, n_nodes, 2)
-    adj_matrix = torch.rand(batch_size, n_nodes, n_nodes)
+    positions = torch.randint(0, n_nodes, (batch_size, n_nodes))
     timesteps = torch.randint(0, 50, (batch_size,))
 
     # Get logits
-    logits = model(coords, adj_matrix, timesteps)
+    logits = model(coords, positions, timesteps)
 
-    # Test sample_from_logits
+    # Test sample_from_logits - returns position indices and log probs
     samples, log_probs = model.sample_from_logits(logits)
 
-    assert samples.shape == (batch_size, n_nodes, n_nodes), f"Wrong sample shape: {samples.shape}"
-    assert log_probs.shape == (batch_size, n_nodes, n_nodes), f"Wrong log_probs shape: {log_probs.shape}"
-    assert torch.all((samples == 0) | (samples == 1)), "Samples should be binary"
+    # Samples are position indices: (batch, n_nodes)
+    assert samples.shape == (batch_size, n_nodes), f"Wrong sample shape: {samples.shape}"
+    # Log probs for each node's sampled position
+    assert log_probs.shape == (batch_size, n_nodes), f"Wrong log_probs shape: {log_probs.shape}"
+    # Position indices should be in [0, n_nodes)
+    assert torch.all(samples >= 0) and torch.all(samples < n_nodes), "Samples should be valid position indices"
 
     print(f"  Samples shape: {samples.shape} [PASS]")
     print(f"  Log probs shape: {log_probs.shape} [PASS]")
@@ -85,14 +89,13 @@ def test_diffusion_model_sampling():
     return True
 
 
-def test_diffusion_model_edge_prediction():
-    """Test edge probability and prediction."""
-    print("\nTesting DiffusionModel edge prediction...")
+def test_sample_prior():
+    """Test prior sampling - uniform over positions."""
+    print("\nTesting prior sampling...")
 
-    batch_size = 2
-    n_nodes = 5
-
+    n_nodes = 10
     model = DiffusionModelDense(
+        n_nodes=n_nodes,
         n_layers=1,
         hidden_dim=16,
         node_dim=16,
@@ -100,44 +103,24 @@ def test_diffusion_model_edge_prediction():
         time_dim=16
     )
 
-    coords = torch.rand(batch_size, n_nodes, 2)
-    adj_matrix = torch.rand(batch_size, n_nodes, n_nodes)
-    timesteps = torch.randint(0, 100, (batch_size,))
-
-    # Test get_edge_probs
-    probs = model.get_edge_probs(coords, adj_matrix, timesteps)
-    assert probs.shape == (batch_size, n_nodes, n_nodes, 2)
-    assert torch.all(probs >= 0) and torch.all(probs <= 1), "Probs should be in [0,1]"
-    assert torch.allclose(probs.sum(dim=-1), torch.ones(batch_size, n_nodes, n_nodes), atol=1e-5), "Probs should sum to 1"
-
-    # Test get_edge_prediction
-    preds = model.get_edge_prediction(coords, adj_matrix, timesteps, threshold=0.5)
-    assert preds.shape == (batch_size, n_nodes, n_nodes)
-    assert torch.all((preds == 0) | (preds == 1)), "Predictions should be binary"
-
-    print(f"  Edge probs shape: {probs.shape} [PASS]")
-    print(f"  Edge predictions shape: {preds.shape} [PASS]")
-    print("  Edge prediction test passed!")
-    return True
-
-
-def test_sample_prior():
-    """Test prior sampling."""
-    print("\nTesting prior sampling...")
-
-    model = DiffusionModelDense(n_layers=1, hidden_dim=16, node_dim=16, edge_dim=16, time_dim=16)
-
-    shape = (4, 10, 10)
+    batch_size = 4
+    shape = (batch_size, n_nodes)
     prior = model.sample_prior(shape, device=torch.device('cpu'))
 
-    assert prior.shape == shape
-    assert torch.all((prior == 0) | (prior == 1)), "Prior should be binary"
-    # Check approximately 50% are 1s (with some tolerance)
-    mean_val = prior.mean().item()
-    assert 0.3 < mean_val < 0.7, f"Prior should be ~50% 1s, got {mean_val:.2%}"
+    # Prior should be position indices: (batch, n_nodes)
+    assert prior.shape == shape, f"Expected {shape}, got {prior.shape}"
+    # Position indices should be in [0, n_nodes)
+    assert torch.all(prior >= 0) and torch.all(prior < n_nodes), "Prior should be valid positions"
 
+    # Check distribution is approximately uniform
+    counts = torch.zeros(n_nodes)
+    for pos in prior.flatten():
+        counts[pos] += 1
+
+    # With batch_size * n_nodes = 40 samples over 10 categories,
+    # expected ~4 per category
     print(f"  Prior shape: {prior.shape} [PASS]")
-    print(f"  Prior mean: {mean_val:.2%} (expected ~50%) [PASS]")
+    print(f"  Position distribution: {counts.tolist()}")
     print("  Prior sampling test passed!")
     return True
 
@@ -150,6 +133,7 @@ def test_gradient_flow():
     n_nodes = 5
 
     model = DiffusionModelDense(
+        n_nodes=n_nodes,
         n_layers=1,
         hidden_dim=16,
         node_dim=16,
@@ -158,11 +142,11 @@ def test_gradient_flow():
     )
 
     coords = torch.rand(batch_size, n_nodes, 2, requires_grad=True)
-    adj_matrix = torch.rand(batch_size, n_nodes, n_nodes)
+    positions = torch.randint(0, n_nodes, (batch_size, n_nodes))
     timesteps = torch.randint(0, 100, (batch_size,))
 
     # Forward pass
-    logits = model(coords, adj_matrix, timesteps)
+    logits = model(coords, positions, timesteps)
     loss = logits.sum()
 
     # Backward pass
@@ -181,18 +165,54 @@ def test_gradient_flow():
     return True
 
 
+def test_position_logits_reasonable():
+    """Test that position logits produce reasonable probabilities."""
+    print("\nTesting position logits are reasonable...")
+
+    batch_size = 2
+    n_nodes = 5
+
+    model = DiffusionModelDense(
+        n_nodes=n_nodes,
+        n_layers=2,
+        hidden_dim=16,
+        node_dim=16,
+        edge_dim=16,
+        time_dim=16
+    )
+
+    coords = torch.rand(batch_size, n_nodes, 2)
+    positions = torch.randint(0, n_nodes, (batch_size, n_nodes))
+    timesteps = torch.randint(0, 100, (batch_size,))
+
+    logits = model(coords, positions, timesteps)
+    probs = torch.softmax(logits, dim=-1)
+
+    # Probabilities should sum to 1 along position dimension
+    prob_sums = probs.sum(dim=-1)
+    assert torch.allclose(prob_sums, torch.ones_like(prob_sums), atol=1e-5), \
+        "Probabilities should sum to 1"
+
+    # All probabilities should be positive
+    assert torch.all(probs >= 0), "All probabilities should be non-negative"
+
+    print(f"  Probs sum correctly: {prob_sums[0].tolist()} [PASS]")
+    print("  Position logits test passed!")
+    return True
+
+
 def run_all_tests():
     """Run all diffusion model tests."""
     print("=" * 50)
-    print("Running DiffusionModel Tests")
+    print("Running DiffusionModel Tests (Categorical)")
     print("=" * 50)
 
     tests = [
         test_diffusion_model_dense_forward,
         test_diffusion_model_sampling,
-        test_diffusion_model_edge_prediction,
         test_sample_prior,
         test_gradient_flow,
+        test_position_logits_reasonable,
     ]
 
     passed = 0

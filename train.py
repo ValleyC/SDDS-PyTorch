@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 
 from Networks import DiffusionModelDense
-from NoiseDistributions import BernoulliNoise
+from NoiseDistributions import CategoricalNoise
 from EnergyFunctions import TSPEnergyClass
 from Trainers import PPOTrainer
 from Data import get_tsp_dataloader
@@ -39,7 +39,7 @@ def get_args():
     parser.add_argument("--n_epochs", type=int, default=100, help="Training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--n_instances", type=int, default=10000, help="Training instances")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--n_basis_states", type=int, default=8, help="Samples per instance")
 
     # PPO settings
@@ -70,7 +70,7 @@ def setup_config(args):
         # Diffusion
         "n_diffusion_steps": args.n_diffusion_steps,
         "diff_schedule": args.diff_schedule,
-        "n_bernoulli_features": 2,
+        "n_bernoulli_features": args.n_nodes,  # Categorical over N positions
 
         # Model
         "n_layers": args.n_layers,
@@ -114,6 +114,7 @@ def main():
     # Create model
     print("Creating model...")
     model = DiffusionModelDense(
+        n_nodes=config["n_nodes"],  # Required for categorical output
         n_layers=config["n_layers"],
         hidden_dim=config["hidden_dim"],
         node_dim=config["node_dim"],
@@ -121,9 +122,9 @@ def main():
         time_dim=config["time_dim"],
     )
 
-    # Create noise distribution
+    # Create noise distribution (CategoricalNoise for permutation-based TSP)
     print("Creating noise distribution...")
-    noise_class = BernoulliNoise(config)
+    noise_class = CategoricalNoise(config)
 
     # Create energy function
     print("Creating energy function...")
@@ -183,7 +184,11 @@ def main():
             for k, v in metrics.items():
                 epoch_metrics[k] = epoch_metrics.get(k, 0) + v
 
-            pbar.set_postfix({"loss": loss.item(), "energy": metrics.get("mean_energy", 0)})
+            pbar.set_postfix({
+                "loss": f"{loss.item():.1f}",
+                "energy": f"{metrics.get('mean_energy', 0):.1f}",
+                "best": f"{metrics.get('best_energy', 0):.1f}"
+            })
 
         # Average metrics
         n_batches = len(train_loader)
@@ -191,7 +196,11 @@ def main():
         for k in epoch_metrics:
             epoch_metrics[k] /= n_batches
 
-        print(f"\nEpoch {epoch+1}: Loss={avg_loss:.4f}, Mean Energy={epoch_metrics.get('mean_energy', 0):.4f}")
+        print(f"\nEpoch {epoch+1}: Loss={avg_loss:.2f}, "
+              f"Actor={epoch_metrics.get('actor_loss', 0):.2f}, "
+              f"Value={epoch_metrics.get('value_loss', 0):.2f}, "
+              f"Energy={epoch_metrics.get('mean_energy', 0):.2f}, "
+              f"Best={epoch_metrics.get('best_energy', 0):.2f}")
 
         # Evaluation
         if (epoch + 1) % args.eval_interval == 0:

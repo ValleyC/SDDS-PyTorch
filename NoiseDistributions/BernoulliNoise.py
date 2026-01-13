@@ -1,8 +1,11 @@
 """
-Bernoulli noise distribution for discrete diffusion.
+Categorical noise distribution for discrete diffusion over positions.
 
-This implements the forward and reverse diffusion process for binary variables
-(e.g., edge presence/absence in graphs).
+This implements the forward and reverse diffusion process for categorical variables
+(e.g., position assignments in TSP permutation formulation).
+
+For TSP, each node has a position variable X[i] in {0, 1, ..., N-1}.
+The forward process randomly flips positions with probability gamma_t.
 """
 
 import torch
@@ -13,27 +16,29 @@ from .BaseNoise import BaseNoiseDistribution
 
 class BernoulliNoise(BaseNoiseDistribution):
     """
-    Bernoulli noise distribution for binary discrete diffusion.
+    Categorical noise distribution for position-based discrete diffusion.
 
-    The forward process gradually flips bits with probability gamma_t:
-        p(X_t | X_{t-1}) = (1-gamma_t) if X_t == X_{t-1} else gamma_t
+    The forward process gradually randomizes positions:
+        p(X_t | X_{t-1}) = (1-gamma_t) if X_t == X_{t-1} else gamma_t / (N-1)
 
-    This is equivalent to:
-        X_t = X_{t-1} with probability (1-gamma_t)
-        X_t = 1-X_{t-1} with probability gamma_t
+    This means:
+        - With probability (1-gamma_t): stay at the same position
+        - With probability gamma_t: flip to a uniform random OTHER position
     """
 
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize Bernoulli noise distribution.
+        Initialize categorical noise distribution.
 
         Args:
             config: Configuration dictionary containing:
                 - n_diffusion_steps: Number of diffusion steps
                 - diff_schedule: Type of noise schedule
-                - beta_factor: Scaling factor for beta
+                - n_nodes: Number of nodes (positions) for TSP
+                - n_bernoulli_features: Number of categories (= n_nodes for TSP)
         """
         super().__init__(config)
+        self.n_categories = config.get("n_bernoulli_features", config.get("n_nodes", 20))
 
     def combine_losses(
         self,
@@ -44,8 +49,6 @@ class BernoulliNoise(BaseNoiseDistribution):
     ) -> torch.Tensor:
         """
         Combine different loss components.
-
-        The total loss is: L_noise + L_energy - T * L_entropy
 
         Args:
             noise_loss: Loss from noise prediction
@@ -71,245 +74,9 @@ class BernoulliNoise(BaseNoiseDistribution):
             entropy_reward: Entropy reward
 
         Returns:
-            Reward tensor: -(noise_distr_step - entropy_reward)
+            Reward tensor
         """
         return -(noise_distr_step - entropy_reward)
-
-    def get_log_p_T_0_per_node(
-        self,
-        X_prev: torch.Tensor,
-        X_next: torch.Tensor,
-        t_idx: int
-    ) -> torch.Tensor:
-        """
-        Compute log probability log p(X_next | X_prev) per node.
-
-        For Bernoulli noise:
-            log p(X_t | X_{t-1}) = X_{t-1} * (X_t * log(1-gamma) + (1-X_t) * log(gamma))
-                                + (1-X_{t-1}) * ((1-X_t) * log(1-gamma) + X_t * log(gamma))
-
-        Args:
-            X_prev: Previous state (batch, ..., features)
-            X_next: Next state (batch, ..., features)
-            t_idx: Timestep index
-
-        Returns:
-            Log probability per node (batch, ...)
-        """
-        gamma_t = self.get_gamma_t(t_idx)
-
-        # Ensure gamma is on the same device
-        if isinstance(gamma_t, torch.Tensor):
-            gamma_t = gamma_t.to(X_prev.device)
-        else:
-            gamma_t = torch.tensor(gamma_t, device=X_prev.device)
-
-        # Clamp gamma to avoid log(0)
-        gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
-
-        X_next_down = 1 - X_next
-        log_1_minus_gamma = torch.log(1 - gamma_t)
-        log_gamma = torch.log(gamma_t)
-
-        # Compute log probability
-        # When X_prev = 1: p(same) = 1-gamma, p(flip) = gamma
-        # When X_prev = 0: p(same) = 1-gamma, p(flip) = gamma
-        noise_per_node = torch.sum(
-            X_prev * (X_next * log_1_minus_gamma + X_next_down * log_gamma) +
-            (1 - X_prev) * (X_next_down * log_1_minus_gamma + X_next * log_gamma),
-            dim=-1
-        )
-
-        return noise_per_node
-
-    def get_log_p_T_0(
-        self,
-        X_prev: torch.Tensor,
-        X_next: torch.Tensor,
-        t_idx: int,
-        node_graph_idx: Optional[torch.Tensor] = None,
-        n_graphs: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        Compute log probability log p(X_next | X_prev) aggregated per graph.
-
-        Args:
-            X_prev: Previous state
-            X_next: Next state
-            t_idx: Timestep index
-            node_graph_idx: Index mapping nodes to graphs (for batched graphs)
-            n_graphs: Number of graphs in batch
-
-        Returns:
-            Log probability per graph
-        """
-        log_p_per_node = self.get_log_p_T_0_per_node(X_prev, X_next, t_idx)
-
-        if node_graph_idx is not None and n_graphs is not None:
-            # Aggregate per graph using scatter_add
-            log_p_per_graph = torch.zeros(n_graphs, device=log_p_per_node.device)
-            log_p_per_graph.scatter_add_(0, node_graph_idx, log_p_per_node)
-        else:
-            # Assume batch dimension is first
-            if log_p_per_node.dim() > 1:
-                log_p_per_graph = log_p_per_node.sum(dim=tuple(range(1, log_p_per_node.dim())))
-            else:
-                log_p_per_graph = log_p_per_node
-
-        return log_p_per_graph
-
-    def sample_forward_diff_process(
-        self,
-        X_t_m1: torch.Tensor,
-        t_idx: int,
-        generator: Optional[torch.Generator] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Sample from the forward diffusion process q(X_t | X_{t-1}).
-
-        This flips each bit with probability gamma_t.
-
-        Args:
-            X_t_m1: State at timestep t-1
-            t_idx: Target timestep index
-            generator: Random generator for reproducibility
-
-        Returns:
-            Tuple of:
-                - X_t: Sampled state at timestep t
-                - spin_log_probs: Log probabilities of sampled states
-                - generator: Updated generator
-        """
-        gamma_t = self.get_gamma_t(t_idx)
-
-        # Ensure gamma is on the same device
-        if isinstance(gamma_t, torch.Tensor):
-            gamma_t = gamma_t.to(X_t_m1.device)
-        else:
-            gamma_t = torch.tensor(gamma_t, device=X_t_m1.device, dtype=X_t_m1.dtype)
-
-        # Clamp gamma to avoid log(0)
-        gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
-
-        X_next_down = 1 - X_t_m1
-
-        # Compute log probabilities for each class (0 and 1)
-        log_1_minus_gamma = torch.log(1 - gamma_t)
-        log_gamma = torch.log(gamma_t)
-
-        # log p(X_t = 1 | X_{t-1})
-        log_p_up = X_t_m1 * log_1_minus_gamma + X_next_down * log_gamma
-        # log p(X_t = 0 | X_{t-1})
-        log_p_down = X_next_down * log_1_minus_gamma + X_t_m1 * log_gamma
-
-        # Stack to get logits for categorical sampling
-        log_p_per_node = torch.stack([log_p_down, log_p_up], dim=-1)
-
-        # Sample from categorical distribution
-        probs = F.softmax(log_p_per_node, dim=-1)
-        X_next = torch.bernoulli(probs[..., 1], generator=generator)
-
-        # Compute log probability of sampled state
-        one_hot_state = F.one_hot(X_next.long(), num_classes=2).float()
-        spin_log_probs = torch.sum(log_p_per_node * one_hot_state, dim=-1)
-
-        return X_next, spin_log_probs, generator
-
-    def sample_forward_from_x0(
-        self,
-        x0: torch.Tensor,
-        t_idx: int,
-        generator: Optional[torch.Generator] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Sample X_t directly from X_0 (marginal distribution).
-
-        For Bernoulli noise, we can compute the marginal:
-            q(X_t | X_0) where the cumulative flip probability is:
-            alpha_t = product of (1 - 2*gamma_i) for i in 1..t
-
-        Args:
-            x0: Clean state at t=0
-            t_idx: Target timestep
-            generator: Random generator
-
-        Returns:
-            Tuple of (x_t, log_prob)
-        """
-        # Compute cumulative flip probability
-        # For each step, prob of staying same: (1-gamma)
-        # For t steps: need to track cumulative effect
-
-        # Simplified: sample step by step (can be optimized)
-        x_t = x0.clone()
-        total_log_prob = torch.zeros(x0.shape[:-1], device=x0.device)
-
-        for t in range(t_idx):
-            x_t, log_prob, generator = self.sample_forward_diff_process(x_t, t, generator)
-            total_log_prob = total_log_prob + log_prob
-
-        return x_t, total_log_prob
-
-    def calc_noise_loss(
-        self,
-        spin_logits_next: torch.Tensor,
-        X_prev: torch.Tensor,
-        t_idx: int,
-        node_graph_idx: Optional[torch.Tensor] = None,
-        n_graphs: Optional[int] = None,
-        T: float = 1.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute the noise-related loss term.
-
-        This computes the KL divergence between the model's predicted
-        transition and the true noise distribution.
-
-        Args:
-            spin_logits_next: Model output logits (batch, ..., 2)
-            X_prev: Previous state
-            t_idx: Current timestep
-            node_graph_idx: Index mapping nodes to graphs
-            n_graphs: Number of graphs
-            T: Temperature
-
-        Returns:
-            Tuple of (noise_loss_per_graph, log_prob_per_node)
-        """
-        gamma_t = self.get_gamma_t(t_idx)
-
-        if isinstance(gamma_t, torch.Tensor):
-            gamma_t = gamma_t.to(X_prev.device)
-        else:
-            gamma_t = torch.tensor(gamma_t, device=X_prev.device)
-
-        gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
-
-        # Get predicted probabilities
-        p_next_up = torch.softmax(spin_logits_next, dim=-1)[..., 1]
-        p_next_down = 1 - p_next_up
-
-        log_1_minus_gamma = torch.log(1 - gamma_t)
-        log_gamma = torch.log(gamma_t)
-
-        # Compute expected log probability under predicted distribution
-        noise_per_node = torch.sum(
-            X_prev * (p_next_up * log_1_minus_gamma + p_next_down * log_gamma) +
-            (1 - X_prev) * (p_next_down * log_1_minus_gamma + p_next_up * log_gamma),
-            dim=-1
-        )
-
-        # Aggregate per graph
-        if node_graph_idx is not None and n_graphs is not None:
-            noise_per_graph = torch.zeros(n_graphs, device=noise_per_node.device)
-            noise_per_graph.scatter_add_(0, node_graph_idx, noise_per_node)
-        else:
-            if noise_per_node.dim() > 1:
-                noise_per_graph = noise_per_node.sum(dim=tuple(range(1, noise_per_node.dim())))
-            else:
-                noise_per_graph = noise_per_node
-
-        return T * noise_per_graph, noise_per_node
 
     def calc_noise_step(
         self,
@@ -321,82 +88,95 @@ class BernoulliNoise(BaseNoiseDistribution):
         """
         Perform one step of the reverse diffusion process.
 
-        Given the model's prediction of X_0, sample X_{t-1}.
+        Given the model's prediction logits, sample X_{t-1} from the posterior.
 
         Args:
-            logits: Model output logits for X_0 prediction
-            X_t: Current noisy state at timestep t
-            t_idx: Current timestep
+            logits: Model output logits (batch, n_nodes, n_positions)
+            X_t: Current position assignments at timestep t (batch, n_nodes)
+            t_idx: Current timestep index (0 to T-1, where 0 is cleanest)
             generator: Random generator
 
         Returns:
-            Tuple of (X_{t-1}, log_prob)
+            Tuple of (X_{t-1}, log_prob per sample)
         """
-        # Get predicted probabilities for X_0
+        batch_size = logits.shape[0]
+        n_nodes = logits.shape[1]
+        n_positions = logits.shape[2]
+        device = logits.device
+
+        # Handle extra dimension in X_t
+        if X_t.dim() == 3:
+            X_t = X_t.squeeze(-1)
+
         # Clamp logits for numerical stability
         logits = torch.clamp(logits, min=-50, max=50)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
-        p_x0 = torch.softmax(logits, dim=-1)
-        # Ensure probabilities are valid
+
+        # Get predicted probabilities for X_0 (clean state)
+        p_x0 = F.softmax(logits, dim=-1)  # (batch, n_nodes, n_positions)
         p_x0 = torch.clamp(p_x0, min=1e-8, max=1-1e-8)
-        # Renormalize
         p_x0 = p_x0 / p_x0.sum(dim=-1, keepdim=True)
 
         if t_idx == 0:
-            # At t=0, just take argmax or sample from predicted distribution
-            X_prev = torch.bernoulli(p_x0[..., 1], generator=generator)
-            log_prob = torch.sum(
-                torch.log(torch.clamp(
-                    X_prev * p_x0[..., 1] + (1 - X_prev) * p_x0[..., 0],
-                    min=1e-8
-                )),
-                dim=-1
-            )
+            # At t=0, sample directly from the predicted distribution
+            X_prev = torch.multinomial(
+                p_x0.view(-1, n_positions),
+                num_samples=1,
+                generator=generator
+            ).view(batch_size, n_nodes)
+
+            # Compute log probability
+            batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, n_nodes)
+            node_idx = torch.arange(n_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
+            log_prob_per_node = torch.log(p_x0[batch_idx, node_idx, X_prev] + 1e-8)
+            log_prob = log_prob_per_node.sum(dim=-1)  # Sum over nodes
+
             return X_prev, log_prob
 
-        # For t > 0, compute posterior q(X_{t-1} | X_t, X_0)
+        # For t > 0, compute posterior q(X_{t-1} | X_t, p_x0)
         gamma_t = self.get_gamma_t(t_idx)
         gamma_t_m1 = self.get_gamma_t(t_idx - 1) if t_idx > 0 else torch.tensor(0.0)
 
         if isinstance(gamma_t, torch.Tensor):
-            gamma_t = gamma_t.to(X_t.device)
+            gamma_t = gamma_t.to(device)
         else:
-            gamma_t = torch.tensor(gamma_t, device=X_t.device)
+            gamma_t = torch.tensor(gamma_t, device=device)
 
         if isinstance(gamma_t_m1, torch.Tensor):
-            gamma_t_m1 = gamma_t_m1.to(X_t.device)
+            gamma_t_m1 = gamma_t_m1.to(device)
         else:
-            gamma_t_m1 = torch.tensor(gamma_t_m1, device=X_t.device)
+            gamma_t_m1 = torch.tensor(gamma_t_m1, device=device)
 
         gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
         gamma_t_m1 = torch.clamp(gamma_t_m1, min=1e-8, max=1-1e-8)
 
-        # Compute posterior
-        # p(X_{t-1} | X_t, X_0) proportional to p(X_t | X_{t-1}) * p(X_{t-1} | X_0)
-        p_x0_1 = p_x0[..., 1]  # p(X_0 = 1)
-        p_x0_0 = p_x0[..., 0]  # p(X_0 = 0)
+        # Compute posterior for each position
+        # p(X_{t-1} = j | X_t, X_0) propto p(X_t | X_{t-1}=j) * p(X_{t-1}=j | X_0)
+        # Simplified: blend predicted X_0 with noise
+        # With prob (1-gamma_{t-1}), X_{t-1} = X_0
+        # With prob gamma_{t-1} / (N-1), X_{t-1} is uniform random
 
-        # p(X_{t-1} = 1 | X_t, X_0)
-        # Simplified: use predicted X_0 to guide sampling
-        # This is an approximation used in many discrete diffusion implementations
+        # For computational simplicity, use:
+        # p_sample = (1 - gamma_{t-1}) * p_x0 + gamma_{t-1} * uniform
+        uniform = torch.ones_like(p_x0) / n_positions
+        p_sample = (1 - gamma_t_m1) * p_x0 + gamma_t_m1 * uniform
 
-        # Sample from the model's prediction with some noise
-        p_sample = p_x0_1 * (1 - gamma_t_m1) + p_x0_0 * gamma_t_m1
+        # Ensure valid probabilities
+        p_sample = torch.clamp(p_sample, min=1e-8, max=1-1e-8)
+        p_sample = p_sample / p_sample.sum(dim=-1, keepdim=True)
 
-        # Ensure valid probability and handle NaN
-        p_sample = torch.nan_to_num(p_sample, nan=0.5)
-        p_sample = torch.clamp(p_sample, min=1e-6, max=1-1e-6)
-
-        X_prev = torch.bernoulli(p_sample, generator=generator)
+        # Sample from posterior
+        X_prev = torch.multinomial(
+            p_sample.view(-1, n_positions),
+            num_samples=1,
+            generator=generator
+        ).view(batch_size, n_nodes)
 
         # Compute log probability
-        log_prob = torch.sum(
-            torch.log(torch.clamp(
-                X_prev * p_sample + (1 - X_prev) * (1 - p_sample),
-                min=1e-8
-            )),
-            dim=-1
-        )
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, n_nodes)
+        node_idx = torch.arange(n_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
+        log_prob_per_node = torch.log(p_sample[batch_idx, node_idx, X_prev] + 1e-8)
+        log_prob = log_prob_per_node.sum(dim=-1)  # Sum over nodes
 
         return X_prev, log_prob
 
@@ -410,88 +190,151 @@ class BernoulliNoise(BaseNoiseDistribution):
         """
         Compute log probability of a given action under the posterior distribution.
 
-        This computes log p(action | X_t, logits) using the same posterior
-        distribution used in calc_noise_step, ensuring consistency for PPO.
-
         Args:
-            logits: Model output logits for X_0 prediction
-            X_t: Current noisy state at timestep t
-            action: The action (X_{t-1}) to compute log prob for
+            logits: Model output logits (batch, n_nodes, n_positions)
+            X_t: Current state at timestep t (batch, n_nodes)
+            action: The action (X_{t-1}) to compute log prob for (batch, n_nodes)
             t_idx: Current timestep index
 
         Returns:
-            Log probability per sample (B,) summed over all edges
+            Log probability per sample (batch,)
         """
-        # Get predicted probabilities for X_0
+        batch_size = logits.shape[0]
+        n_nodes = logits.shape[1]
+        n_positions = logits.shape[2]
+        device = logits.device
+
+        # Handle extra dimension
+        if action.dim() == 3:
+            action = action.squeeze(-1)
+
+        # Clamp logits for numerical stability
         logits = torch.clamp(logits, min=-50, max=50)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
-        p_x0 = torch.softmax(logits, dim=-1)
+
+        # Get predicted probabilities for X_0
+        p_x0 = F.softmax(logits, dim=-1)
         p_x0 = torch.clamp(p_x0, min=1e-8, max=1-1e-8)
         p_x0 = p_x0 / p_x0.sum(dim=-1, keepdim=True)
 
         if t_idx == 0:
             # At t=0, use p_x0 directly
-            p_sample = p_x0[..., 1]
+            p_sample = p_x0
         else:
-            # For t > 0, compute posterior p_sample
-            gamma_t = self.get_gamma_t(t_idx)
+            # For t > 0, compute posterior
             gamma_t_m1 = self.get_gamma_t(t_idx - 1) if t_idx > 0 else torch.tensor(0.0)
 
-            if isinstance(gamma_t, torch.Tensor):
-                gamma_t = gamma_t.to(action.device)
-            else:
-                gamma_t = torch.tensor(gamma_t, device=action.device)
-
             if isinstance(gamma_t_m1, torch.Tensor):
-                gamma_t_m1 = gamma_t_m1.to(action.device)
+                gamma_t_m1 = gamma_t_m1.to(device)
             else:
-                gamma_t_m1 = torch.tensor(gamma_t_m1, device=action.device)
+                gamma_t_m1 = torch.tensor(gamma_t_m1, device=device)
 
-            gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
             gamma_t_m1 = torch.clamp(gamma_t_m1, min=1e-8, max=1-1e-8)
 
-            p_x0_1 = p_x0[..., 1]
-            p_x0_0 = p_x0[..., 0]
-
             # Same posterior formula as calc_noise_step
-            p_sample = p_x0_1 * (1 - gamma_t_m1) + p_x0_0 * gamma_t_m1
+            uniform = torch.ones_like(p_x0) / n_positions
+            p_sample = (1 - gamma_t_m1) * p_x0 + gamma_t_m1 * uniform
 
-        # Ensure valid probability
-        p_sample = torch.nan_to_num(p_sample, nan=0.5)
-        p_sample = torch.clamp(p_sample, min=1e-6, max=1-1e-6)
+        # Ensure valid probabilities
+        p_sample = torch.clamp(p_sample, min=1e-8, max=1-1e-8)
+        p_sample = p_sample / p_sample.sum(dim=-1, keepdim=True)
 
         # Compute log probability of the given action
-        # p(action=1) = p_sample, p(action=0) = 1 - p_sample
-        log_prob_per_edge = torch.where(
-            action == 1,
-            torch.log(p_sample),
-            torch.log(1 - p_sample)
-        )
+        action_long = action.long()
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, n_nodes)
+        node_idx = torch.arange(n_nodes, device=device).unsqueeze(0).expand(batch_size, -1)
+        log_prob_per_node = torch.log(p_sample[batch_idx, node_idx, action_long] + 1e-8)
 
-        # Sum over all edges for per-sample log prob
-        return log_prob_per_edge.sum(dim=(-2, -1))
+        # Sum over all nodes
+        return log_prob_per_node.sum(dim=-1)
 
-    def calc_noise_step_deterministic(
+    def sample_forward_diff_process(
         self,
-        logits: torch.Tensor,
-        X_t: torch.Tensor,
+        X_t_m1: torch.Tensor,
         t_idx: int,
-        threshold: float = 0.5
-    ) -> torch.Tensor:
+        generator: Optional[torch.Generator] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Generator]:
         """
-        Perform deterministic reverse step (for final decoding).
+        Sample from the forward diffusion process q(X_t | X_{t-1}).
+
+        With probability gamma_t, flip to a random position.
+        With probability (1-gamma_t), stay at the same position.
 
         Args:
-            logits: Model output logits
-            X_t: Current state
-            t_idx: Current timestep
-            threshold: Threshold for binarization
+            X_t_m1: State at timestep t-1 (batch, n_nodes)
+            t_idx: Target timestep index
+            generator: Random generator
 
         Returns:
-            X_{t-1}: Deterministic next state
+            Tuple of (X_t, log_probs, generator)
         """
-        p_x0 = torch.softmax(logits, dim=-1)[..., 1]
-        return (p_x0 > threshold).float()
+        batch_size, n_nodes = X_t_m1.shape[:2]
+        device = X_t_m1.device
+
+        # Handle extra dimension
+        if X_t_m1.dim() == 3:
+            X_t_m1 = X_t_m1.squeeze(-1)
+
+        gamma_t = self.get_gamma_t(t_idx)
+
+        if isinstance(gamma_t, torch.Tensor):
+            gamma_t = gamma_t.to(device)
+        else:
+            gamma_t = torch.tensor(gamma_t, device=device)
+
+        gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
+
+        # Sample flip mask: which nodes will flip
+        flip_mask = torch.bernoulli(
+            torch.full((batch_size, n_nodes), gamma_t.item(), device=device),
+            generator=generator
+        )
+
+        # Sample new random positions for flipped nodes
+        random_positions = torch.randint(
+            0, self.n_categories,
+            (batch_size, n_nodes),
+            device=device,
+            generator=generator
+        )
+
+        # Apply flips
+        X_t = torch.where(flip_mask.bool(), random_positions, X_t_m1.long())
+
+        # Compute log probability
+        # p(X_t = x | X_{t-1}) = (1-gamma) if x == X_{t-1} else gamma/N
+        same_mask = (X_t == X_t_m1.long()).float()
+        log_p_same = torch.log(1 - gamma_t)
+        log_p_flip = torch.log(gamma_t / self.n_categories)
+        log_prob_per_node = same_mask * log_p_same + (1 - same_mask) * log_p_flip
+        log_prob = log_prob_per_node.sum(dim=-1)
+
+        return X_t, log_prob, generator
+
+    def sample_prior(
+        self,
+        shape: Tuple[int, ...],
+        device: torch.device,
+        generator: Optional[torch.Generator] = None
+    ) -> torch.Tensor:
+        """
+        Sample from the prior distribution (uniform over positions).
+
+        Args:
+            shape: (batch_size, n_nodes)
+            device: Device to create tensor on
+            generator: Random generator
+
+        Returns:
+            Sampled position indices
+        """
+        batch_size, n_nodes = shape[:2]
+        return torch.randint(
+            0, self.n_categories,
+            (batch_size, n_nodes),
+            device=device,
+            generator=generator
+        )
 
     def get_entropy(
         self,
@@ -503,35 +346,126 @@ class BernoulliNoise(BaseNoiseDistribution):
         Compute entropy of the predicted distribution.
 
         Args:
-            logits: Model output logits
-            node_graph_idx: Index mapping nodes to graphs
-            n_graphs: Number of graphs
+            logits: Model output logits (batch, n_nodes, n_positions)
+            node_graph_idx: Not used for batched mode
+            n_graphs: Not used for batched mode
 
         Returns:
-            Entropy per graph
+            Entropy per sample (batch,)
         """
         # Numerical stability
         logits = torch.clamp(logits, min=-50, max=50)
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
-        probs = torch.softmax(logits, dim=-1)
+
+        probs = F.softmax(logits, dim=-1)
         probs = torch.clamp(probs, min=1e-8, max=1-1e-8)
-        entropy_per_node = -torch.sum(
-            probs * torch.log(probs),
-            dim=-1
-        )
+
+        # Entropy per node: -sum_i p_i log p_i
+        entropy_per_node = -torch.sum(probs * torch.log(probs), dim=-1)  # (batch, n_nodes)
         entropy_per_node = torch.nan_to_num(entropy_per_node, nan=0.0)
 
-        # Sum over feature dimension if present
-        if entropy_per_node.dim() > 1:
-            entropy_per_node = entropy_per_node.sum(dim=-1)
+        # Sum over nodes
+        return entropy_per_node.sum(dim=-1)  # (batch,)
 
-        if node_graph_idx is not None and n_graphs is not None:
-            entropy_per_graph = torch.zeros(n_graphs, device=entropy_per_node.device)
-            entropy_per_graph.scatter_add_(0, node_graph_idx, entropy_per_node)
+    def get_log_p_T_0(
+        self,
+        X_prev: torch.Tensor,
+        X_next: torch.Tensor,
+        t_idx: int,
+        node_graph_idx: Optional[torch.Tensor] = None,
+        n_graphs: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Compute log probability log p(X_next | X_prev).
+
+        Args:
+            X_prev: Previous state (batch, n_nodes)
+            X_next: Next state (batch, n_nodes)
+            t_idx: Timestep index
+            node_graph_idx: Not used
+            n_graphs: Not used
+
+        Returns:
+            Log probability per sample (batch,)
+        """
+        # Handle extra dimension
+        if X_prev.dim() == 3:
+            X_prev = X_prev.squeeze(-1)
+        if X_next.dim() == 3:
+            X_next = X_next.squeeze(-1)
+
+        gamma_t = self.get_gamma_t(t_idx)
+
+        if isinstance(gamma_t, torch.Tensor):
+            gamma_t = gamma_t.to(X_prev.device)
         else:
-            if entropy_per_node.dim() > 1:
-                entropy_per_graph = entropy_per_node.sum(dim=tuple(range(1, entropy_per_node.dim())))
-            else:
-                entropy_per_graph = entropy_per_node
+            gamma_t = torch.tensor(gamma_t, device=X_prev.device)
 
-        return entropy_per_graph
+        gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
+
+        # p(X_next | X_prev) = (1-gamma) if same, else gamma/N
+        same_mask = (X_next.long() == X_prev.long()).float()
+        log_p_same = torch.log(1 - gamma_t)
+        log_p_flip = torch.log(gamma_t / self.n_categories)
+        log_prob_per_node = same_mask * log_p_same + (1 - same_mask) * log_p_flip
+
+        return log_prob_per_node.sum(dim=-1)
+
+    def calc_noise_loss(
+        self,
+        logits: torch.Tensor,
+        X_prev: torch.Tensor,
+        t_idx: int,
+        node_graph_idx: Optional[torch.Tensor] = None,
+        n_graphs: Optional[int] = None,
+        T: float = 1.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute the noise-related loss term.
+
+        Args:
+            logits: Model output logits (batch, n_nodes, n_positions)
+            X_prev: Previous state (batch, n_nodes)
+            t_idx: Current timestep
+            node_graph_idx: Not used
+            n_graphs: Not used
+            T: Temperature
+
+        Returns:
+            Tuple of (noise_loss, log_prob_per_node)
+        """
+        # Handle extra dimension
+        if X_prev.dim() == 3:
+            X_prev = X_prev.squeeze(-1)
+
+        gamma_t = self.get_gamma_t(t_idx)
+
+        if isinstance(gamma_t, torch.Tensor):
+            gamma_t = gamma_t.to(X_prev.device)
+        else:
+            gamma_t = torch.tensor(gamma_t, device=X_prev.device)
+
+        gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
+
+        # Get predicted probabilities
+        logits = torch.clamp(logits, min=-50, max=50)
+        p_next = F.softmax(logits, dim=-1)  # (batch, n_nodes, n_positions)
+
+        # Create one-hot of previous state
+        X_prev_long = X_prev.long()
+        one_hot_prev = F.one_hot(X_prev_long, num_classes=self.n_categories).float()
+
+        # Expected log probability under forward noise
+        # p(X_t | X_prev) = (1-gamma) * I(X_t == X_prev) + gamma/N
+        # E_p[log q(X_t)] where q is the predicted distribution
+        log_p_next = torch.log(p_next + 1e-8)
+
+        # Expected log prob = sum_x p(x|X_prev) * log q(x)
+        # = (1-gamma) * log q(X_prev) + (gamma/N) * sum_x log q(x)
+        log_q_prev = (log_p_next * one_hot_prev).sum(dim=-1)  # (batch, n_nodes)
+        mean_log_q = log_p_next.mean(dim=-1)  # (batch, n_nodes)
+
+        noise_per_node = (1 - gamma_t) * log_q_prev + gamma_t * mean_log_q
+        noise_loss = T * noise_per_node.sum(dim=-1)  # (batch,)
+
+        return noise_loss, noise_per_node
