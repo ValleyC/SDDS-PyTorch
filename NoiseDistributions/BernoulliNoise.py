@@ -37,26 +37,26 @@ class BernoulliNoise(BaseNoiseDistribution):
 
     def combine_losses(
         self,
-        entropy_loss: torch.Tensor,
         noise_loss: torch.Tensor,
         energy_loss: torch.Tensor,
+        entropy_loss: torch.Tensor,
         T: float = 1.0
     ) -> torch.Tensor:
         """
         Combine different loss components.
 
-        The total loss is: -T * L_entropy + L_noise + L_energy
+        The total loss is: L_noise + L_energy - T * L_entropy
 
         Args:
-            entropy_loss: Entropy regularization loss
             noise_loss: Loss from noise prediction
             energy_loss: Loss from energy/reward
-            T: Temperature parameter
+            entropy_loss: Entropy regularization loss
+            T: Temperature parameter for entropy bonus
 
         Returns:
             Combined loss
         """
-        return -T * entropy_loss + noise_loss + energy_loss
+        return noise_loss + energy_loss - T * entropy_loss
 
     def calculate_noise_distr_reward(
         self,
@@ -399,6 +399,77 @@ class BernoulliNoise(BaseNoiseDistribution):
         )
 
         return X_prev, log_prob
+
+    def compute_action_log_prob(
+        self,
+        logits: torch.Tensor,
+        X_t: torch.Tensor,
+        action: torch.Tensor,
+        t_idx: int
+    ) -> torch.Tensor:
+        """
+        Compute log probability of a given action under the posterior distribution.
+
+        This computes log p(action | X_t, logits) using the same posterior
+        distribution used in calc_noise_step, ensuring consistency for PPO.
+
+        Args:
+            logits: Model output logits for X_0 prediction
+            X_t: Current noisy state at timestep t
+            action: The action (X_{t-1}) to compute log prob for
+            t_idx: Current timestep index
+
+        Returns:
+            Log probability per sample (B,) summed over all edges
+        """
+        # Get predicted probabilities for X_0
+        logits = torch.clamp(logits, min=-50, max=50)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+        p_x0 = torch.softmax(logits, dim=-1)
+        p_x0 = torch.clamp(p_x0, min=1e-8, max=1-1e-8)
+        p_x0 = p_x0 / p_x0.sum(dim=-1, keepdim=True)
+
+        if t_idx == 0:
+            # At t=0, use p_x0 directly
+            p_sample = p_x0[..., 1]
+        else:
+            # For t > 0, compute posterior p_sample
+            gamma_t = self.get_gamma_t(t_idx)
+            gamma_t_m1 = self.get_gamma_t(t_idx - 1) if t_idx > 0 else torch.tensor(0.0)
+
+            if isinstance(gamma_t, torch.Tensor):
+                gamma_t = gamma_t.to(action.device)
+            else:
+                gamma_t = torch.tensor(gamma_t, device=action.device)
+
+            if isinstance(gamma_t_m1, torch.Tensor):
+                gamma_t_m1 = gamma_t_m1.to(action.device)
+            else:
+                gamma_t_m1 = torch.tensor(gamma_t_m1, device=action.device)
+
+            gamma_t = torch.clamp(gamma_t, min=1e-8, max=1-1e-8)
+            gamma_t_m1 = torch.clamp(gamma_t_m1, min=1e-8, max=1-1e-8)
+
+            p_x0_1 = p_x0[..., 1]
+            p_x0_0 = p_x0[..., 0]
+
+            # Same posterior formula as calc_noise_step
+            p_sample = p_x0_1 * (1 - gamma_t_m1) + p_x0_0 * gamma_t_m1
+
+        # Ensure valid probability
+        p_sample = torch.nan_to_num(p_sample, nan=0.5)
+        p_sample = torch.clamp(p_sample, min=1e-6, max=1-1e-6)
+
+        # Compute log probability of the given action
+        # p(action=1) = p_sample, p(action=0) = 1 - p_sample
+        log_prob_per_edge = torch.where(
+            action == 1,
+            torch.log(p_sample),
+            torch.log(1 - p_sample)
+        )
+
+        # Sum over all edges for per-sample log prob
+        return log_prob_per_edge.sum(dim=(-2, -1))
 
     def calc_noise_step_deterministic(
         self,

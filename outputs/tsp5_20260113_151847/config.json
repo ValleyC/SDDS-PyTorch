@@ -1,0 +1,21 @@
+{
+  "n_nodes": 5,
+  "problem_name": "TSP",
+  "n_diffusion_steps": 3,
+  "diff_schedule": "DiffUCO",
+  "n_bernoulli_features": 2,
+  "n_layers": 2,
+  "hidden_dim": 32,
+  "node_dim": 32,
+  "edge_dim": 32,
+  "time_dim": 32,
+  "batch_size": 4,
+  "learning_rate": 0.0001,
+  "n_basis_states": 2,
+  "clip_value": 0.2,
+  "value_coef": 0.5,
+  "gae_lambda": 0.95,
+  "n_inner_steps": 4,
+  "penalty_weight": 1.0,
+  "seed": 42
+}

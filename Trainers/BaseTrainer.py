@@ -292,12 +292,14 @@ class BaseTrainer(ABC):
         Returns:
             Tuple of (x_{t-1}, log_prob, logits)
         """
-        # Get model prediction
-        timestep = torch.full((coords.shape[0],), t / self.n_diffusion_steps, device=self.device)
+        # Get model prediction (use integer timestep for consistency)
+        timestep = torch.full((coords.shape[0],), t, device=self.device, dtype=torch.long)
         logits = self.model(coords, x_t, timestep, edge_index)
 
-        # Sample next state
-        x_prev, log_prob = self.noise_class.calc_noise_step(logits, x_t, t, key)
+        # Sample next state using corrected noise schedule index
+        # t is the diffusion timestep (T-1 to 0), noise_t_idx maps to beta_arr
+        noise_t_idx = self.n_diffusion_steps - 1 - t
+        x_prev, log_prob = self.noise_class.calc_noise_step(logits, x_t, noise_t_idx, key)
 
         return x_prev, log_prob, logits
 
