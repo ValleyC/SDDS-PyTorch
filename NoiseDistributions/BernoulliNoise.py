@@ -333,7 +333,14 @@ class BernoulliNoise(BaseNoiseDistribution):
             Tuple of (X_{t-1}, log_prob)
         """
         # Get predicted probabilities for X_0
+        # Clamp logits for numerical stability
+        logits = torch.clamp(logits, min=-50, max=50)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         p_x0 = torch.softmax(logits, dim=-1)
+        # Ensure probabilities are valid
+        p_x0 = torch.clamp(p_x0, min=1e-8, max=1-1e-8)
+        # Renormalize
+        p_x0 = p_x0 / p_x0.sum(dim=-1, keepdim=True)
 
         if t_idx == 0:
             # At t=0, just take argmax or sample from predicted distribution
@@ -376,8 +383,9 @@ class BernoulliNoise(BaseNoiseDistribution):
         # Sample from the model's prediction with some noise
         p_sample = p_x0_1 * (1 - gamma_t_m1) + p_x0_0 * gamma_t_m1
 
-        # Add influence from current state
-        p_sample = torch.clamp(p_sample, min=1e-8, max=1-1e-8)
+        # Ensure valid probability and handle NaN
+        p_sample = torch.nan_to_num(p_sample, nan=0.5)
+        p_sample = torch.clamp(p_sample, min=1e-6, max=1-1e-6)
 
         X_prev = torch.bernoulli(p_sample, generator=generator)
 
@@ -431,11 +439,16 @@ class BernoulliNoise(BaseNoiseDistribution):
         Returns:
             Entropy per graph
         """
+        # Numerical stability
+        logits = torch.clamp(logits, min=-50, max=50)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         probs = torch.softmax(logits, dim=-1)
+        probs = torch.clamp(probs, min=1e-8, max=1-1e-8)
         entropy_per_node = -torch.sum(
-            probs * torch.log(torch.clamp(probs, min=1e-8)),
+            probs * torch.log(probs),
             dim=-1
         )
+        entropy_per_node = torch.nan_to_num(entropy_per_node, nan=0.0)
 
         # Sum over feature dimension if present
         if entropy_per_node.dim() > 1:
