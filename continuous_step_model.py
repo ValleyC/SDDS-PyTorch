@@ -17,12 +17,12 @@ from typing import Tuple, Optional
 
 try:
     from .step_model import (
-        EncodeProcessDecode, ReluMLP, ValueMLP,
+        EncodeProcessDecode, ReluMLP,
         get_sinusoidal_positional_encoding, scatter_sum
     )
 except ImportError:
     from step_model import (
-        EncodeProcessDecode, ReluMLP, ValueMLP,
+        EncodeProcessDecode, ReluMLP,
         get_sinusoidal_positional_encoding, scatter_sum
     )
 
@@ -96,23 +96,21 @@ class ContinuousDiffusionStepModel(nn.Module):
             mean_aggr=mean_aggr,
         )
 
-        # Mean head: unbounded output for position mean
-        self.mean_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, continuous_dim),
-        )
+        # Mean head: single linear projection (matches DIffUCO ContinuousHead)
+        self.mean_head = nn.Linear(hidden_dim, continuous_dim)
 
-        # Log-variance head: clipped to [-10, 2]
-        self.log_var_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, continuous_dim),
-        )
+        # Log-variance head: single linear projection, clipped to [-10, 2]
+        self.log_var_head = nn.Linear(hidden_dim, continuous_dim)
 
-        # Value head (same architecture as DiffusionStepModel)
-        value_features = [hidden_dim, 120, 64, 1]
-        self.value_head = ValueMLP(value_features)
+        # Value head: plain Dense+ReLU stack (matching JAX ContinuousHead,
+        # which does NOT use LayerNorm unlike the categorical ValueMLP)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, 120),
+            nn.ReLU(),
+            nn.Linear(120, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
 
     def _build_input(
         self,

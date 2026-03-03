@@ -120,6 +120,7 @@ def evaluate_chip_placement(
                 node_graph_idx, n_graphs,
                 overlap_weight=overlap_weight,
                 boundary_weight=boundary_weight,
+                edge_attr=edge_attr,
             )
 
             all_energies.append(energy.cpu().numpy())
@@ -139,7 +140,7 @@ def evaluate_chip_placement(
     best_energy_per_graph = np.min(energies, axis=0)
     best_idx_per_graph = np.argmin(energies, axis=0)
 
-    # Corresponding metrics for best energy solutions
+    # Corresponding metrics for best-energy solutions
     best_hpwl_per_graph = np.array([
         hpwls[best_idx_per_graph[g], g] for g in range(n_graphs)
     ])
@@ -150,6 +151,19 @@ def evaluate_chip_placement(
         boundaries[best_idx_per_graph[g], g] for g in range(n_graphs)
     ])
 
+    # Best HPWL among (near-)legal solutions: overlap < threshold
+    # This avoids the degenerate case where collapsed placements have low energy
+    overlap_threshold = 1e-3
+    legal_mask = overlaps < overlap_threshold  # (n_basis, n_graphs)
+    legal_hpwls = np.where(legal_mask, hpwls, np.inf)
+    best_legal_hpwl_per_graph = np.min(legal_hpwls, axis=0)
+    legal_ratio = legal_mask.any(axis=0).mean()  # fraction of graphs with >=1 legal solution
+
+    # Handle case where no legal solutions exist for a graph
+    best_legal_hpwl_per_graph = np.where(
+        np.isinf(best_legal_hpwl_per_graph), np.nan, best_legal_hpwl_per_graph
+    )
+
     return {
         'mean_energy': np.mean(energies),
         'best_energy': np.mean(best_energy_per_graph),
@@ -159,6 +173,8 @@ def evaluate_chip_placement(
         'best_overlap': np.mean(best_overlap_per_graph),
         'mean_boundary': np.mean(boundaries),
         'best_boundary': np.mean(best_boundary_per_graph),
+        'best_legal_hpwl': np.nanmean(best_legal_hpwl_per_graph),
+        'legal_ratio': legal_ratio,
         'all_energies': energies,
     }
 
@@ -290,7 +306,6 @@ def main():
     # Create noise schedule
     noise_schedule = GaussianNoiseSchedule(
         n_steps=args.n_diffusion_steps,
-        continuous_dim=2,
         schedule='diffuco',
     )
 
@@ -362,6 +377,7 @@ def main():
             edge_index=edge_index,
             overlap_weight=args.overlap_weight,
             boundary_weight=args.boundary_weight,
+            edge_attr=edge_attr,
         )
 
         # Training step
@@ -432,11 +448,15 @@ def main():
             tqdm.write(f"  Best HPWL:   {eval_results['best_hpwl']:.4f}")
             tqdm.write(f"  Best overlap: {eval_results['best_overlap']:.6f}")
             tqdm.write(f"  Best boundary: {eval_results['best_boundary']:.6f}")
+            tqdm.write(f"  Legal ratio: {eval_results['legal_ratio']:.2%}")
+            if not np.isnan(eval_results['best_legal_hpwl']):
+                tqdm.write(f"  Best legal HPWL: {eval_results['best_legal_hpwl']:.4f}")
 
             # Also evaluate on legal placements as reference
             legal_energy, legal_hpwl, legal_overlap, legal_boundary = compute_chip_placement_energy(
                 test_legal, test_nf, test_ei, test_ngi, args.n_graphs,
                 args.overlap_weight, args.boundary_weight,
+                edge_attr=test_ea,
             )
             tqdm.write(f"  [Reference] Legal HPWL: {legal_hpwl.mean().item():.4f}, "
                         f"overlap: {legal_overlap.mean().item():.6f}, "
@@ -467,6 +487,8 @@ def main():
                 'eval/best_overlap': eval_results['best_overlap'],
                 'eval/mean_boundary': eval_results['mean_boundary'],
                 'eval/best_boundary': eval_results['best_boundary'],
+                'eval/best_legal_hpwl': eval_results['best_legal_hpwl'],
+                'eval/legal_ratio': eval_results['legal_ratio'],
                 'eval/legal_hpwl': legal_hpwl.mean().item(),
                 'eval/epochs_since_best': epochs_since_best,
                 'eval/best_energy_overall': best_energy,

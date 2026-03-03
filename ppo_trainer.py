@@ -729,12 +729,9 @@ class ContinuousPPOTrainer:
                     ratios, 1 - self.clip_value, 1 + self.clip_value
                 ) * adv
 
-                if n_graphs > 1:
-                    actor_loss = -torch.min(surr1, surr2)[:-1].mean()
-                    critic_loss = F.mse_loss(values[:-1], v_target[:-1])
-                else:
-                    actor_loss = -torch.min(surr1, surr2).mean()
-                    critic_loss = F.mse_loss(values, v_target)
+                # No [:-1] slicing — our chip batch has no padding graphs
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = F.mse_loss(values, v_target)
 
                 total_actor_loss += actor_loss
                 total_critic_loss += critic_loss

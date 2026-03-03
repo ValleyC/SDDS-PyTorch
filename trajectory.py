@@ -930,8 +930,10 @@ def collect_continuous_trajectory(
     rewards = combined_rewards.clone()
     if per_step_energy:
         rewards = rewards + energy_rewards_per_step
-    # Always add final energy
-    rewards[-1] = rewards[-1] + energy_rewards_final
+        # per_step already includes the final step — do NOT double-count
+    else:
+        # Only add final energy when per-step is disabled
+        rewards[-1] = rewards[-1] + energy_rewards_final
 
     # === Diagnostic log probs ===
     log_q_0_T = torch.zeros(
@@ -944,7 +946,7 @@ def collect_continuous_trajectory(
     )
     log_q_0_T[0] = log_q_T
     log_q_0_T[1:] = log_policies
-    T_scale = T_temperature * 1e-6 if T_temperature > 0 else 1e-6
+    T_scale = T_temperature if T_temperature > 0 else 1.0
     log_p_0_T[:-1] = -1.0 / T_scale * noise_rewards
     log_p_0_T[-1] = 1.0 / T_scale * energy_step_final
 

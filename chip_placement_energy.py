@@ -20,11 +20,15 @@ def _compute_hpwl(
     edge_index: torch.Tensor,
     node_graph_idx: torch.Tensor,
     n_graphs: int,
+    edge_attr: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Compute Half-Perimeter Wirelength.
+    Compute Half-Perimeter Wirelength using terminal (pin) positions.
 
-    For each edge (2-pin net): HPWL = |x_sender - x_receiver| + |y_sender - y_receiver|
+    For each edge (2-pin net):
+        pin_src = component_center_src + terminal_offset_src
+        pin_dst = component_center_dst + terminal_offset_dst
+        HPWL = |pin_src_x - pin_dst_x| + |pin_src_y - pin_dst_y|
     Aggregated per graph.
 
     Args:
@@ -32,6 +36,8 @@ def _compute_hpwl(
         edge_index: (2, n_edges) sender/receiver indices
         node_graph_idx: (n_components,) graph assignment
         n_graphs: number of graphs
+        edge_attr: (n_edges, 4) terminal offsets [src_dx, src_dy, dst_dx, dst_dy]
+                   If None, falls back to center-to-center.
 
     Returns:
         hpwl_per_graph: (n_graphs,)
@@ -42,9 +48,18 @@ def _compute_hpwl(
     sender_pos = positions[senders]    # (n_edges, 2)
     receiver_pos = positions[receivers]  # (n_edges, 2)
 
+    if edge_attr is not None and edge_attr.shape[1] >= 4:
+        # Pin positions = component center + terminal offset
+        src_pin = sender_pos + edge_attr[:, 0:2]    # (n_edges, 2)
+        dst_pin = receiver_pos + edge_attr[:, 2:4]  # (n_edges, 2)
+    else:
+        # Fallback: center-to-center
+        src_pin = sender_pos
+        dst_pin = receiver_pos
+
     # Bounding box for 2-pin nets
-    bbox_width = torch.abs(sender_pos[:, 0] - receiver_pos[:, 0])
-    bbox_height = torch.abs(sender_pos[:, 1] - receiver_pos[:, 1])
+    bbox_width = torch.abs(src_pin[:, 0] - dst_pin[:, 0])
+    bbox_height = torch.abs(src_pin[:, 1] - dst_pin[:, 1])
     hpwl_per_edge = bbox_width + bbox_height  # (n_edges,)
 
     # Aggregate to graph level via sender node's graph
@@ -178,6 +193,7 @@ def compute_chip_placement_energy(
     canvas_y_min: float = -1.0,
     canvas_width: float = 2.0,
     canvas_height: float = 2.0,
+    edge_attr: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute total chip placement energy.
@@ -194,6 +210,7 @@ def compute_chip_placement_energy(
         n_graphs: number of graphs
         overlap_weight: penalty weight for overlap (multiplied by HPWL)
         boundary_weight: penalty weight for boundary (multiplied by HPWL)
+        edge_attr: (n_edges, 4) terminal offsets [src_dx, src_dy, dst_dx, dst_dy]
 
     Returns:
         energy_per_graph: (n_graphs,) total energy
@@ -201,7 +218,7 @@ def compute_chip_placement_energy(
         overlap_per_graph: (n_graphs,) raw overlap area
         boundary_per_graph: (n_graphs,) raw boundary violation
     """
-    hpwl_per_graph = _compute_hpwl(positions, edge_index, node_graph_idx, n_graphs)
+    hpwl_per_graph = _compute_hpwl(positions, edge_index, node_graph_idx, n_graphs, edge_attr)
 
     overlap_per_graph = _compute_overlap_penalty(
         positions, component_sizes, node_graph_idx, n_graphs
@@ -234,6 +251,7 @@ def create_chip_placement_energy_fn(
     canvas_y_min: float = -1.0,
     canvas_width: float = 2.0,
     canvas_height: float = 2.0,
+    edge_attr: torch.Tensor = None,
 ) -> Callable:
     """
     Factory: create energy_fn matching trajectory.py interface.
@@ -250,7 +268,8 @@ def create_chip_placement_energy_fn(
             positions, component_sizes, edge_index,
             node_graph_idx, n_graphs,
             overlap_weight, boundary_weight,
-            canvas_x_min, canvas_y_min, canvas_width, canvas_height
+            canvas_x_min, canvas_y_min, canvas_width, canvas_height,
+            edge_attr,
         )
         return energy
 

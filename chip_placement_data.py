@@ -44,6 +44,7 @@ def _place_components_legal(
     x_sizes: np.ndarray,
     y_sizes: np.ndarray,
     stop_density: float,
+    rng: np.random.Generator,
     canvas: float = 1.0,
     max_attempts: int = 500,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -54,6 +55,7 @@ def _place_components_legal(
         x_sizes: (pool_size,) width of each candidate component
         y_sizes: (pool_size,) height
         stop_density: target placement density
+        rng: seeded random generator for reproducibility
         canvas: half-size of canvas (canvas is [-canvas, canvas]^2)
         max_attempts: max random position attempts per component
 
@@ -70,8 +72,6 @@ def _place_components_legal(
     # Sort by area (largest first for better packing)
     areas = x_sizes * y_sizes
     order = np.argsort(-areas)
-
-    rng = np.random.default_rng()
 
     for idx in order:
         if total_area / canvas_area >= stop_density:
@@ -125,6 +125,7 @@ def _place_components_legal(
 def _generate_netlist_proximity(
     positions: np.ndarray,
     sizes: np.ndarray,
+    rng: np.random.Generator,
     k: int = 5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -133,6 +134,7 @@ def _generate_netlist_proximity(
     Args:
         positions: (V, 2) component centers
         sizes: (V, 2) component (width, height)
+        rng: seeded random generator for reproducibility
         k: number of nearest neighbors to connect
 
     Returns:
@@ -141,8 +143,6 @@ def _generate_netlist_proximity(
     """
     V = positions.shape[0]
     k = min(k, V - 1)
-
-    rng = np.random.default_rng()
 
     # Pairwise distances
     diff = positions[:, None, :] - positions[None, :, :]  # (V, V, 2)
@@ -191,9 +191,6 @@ def generate_chip_instance(
         'density': float
         'n_components': int
     """
-    if seed is not None:
-        np.random.seed(seed)
-
     preset = SCALE_PRESETS.get(dataset_name, SCALE_PRESETS["Chip_20_components"])
     max_pool = preset["max_pool"]
     lo_size, hi_size = preset["long_size_range"]
@@ -217,11 +214,11 @@ def generate_chip_instance(
 
     # Step 1: Place legally
     legal_positions, sizes, density = _place_components_legal(
-        x_sizes, y_sizes, stop_density
+        x_sizes, y_sizes, stop_density, rng
     )
 
     # Step 2: Generate proximity netlist
-    edge_index, edge_attr = _generate_netlist_proximity(legal_positions, sizes)
+    edge_index, edge_attr = _generate_netlist_proximity(legal_positions, sizes, rng)
 
     # Step 3: Randomize positions (uniform in [-1, 1])
     V = sizes.shape[0]

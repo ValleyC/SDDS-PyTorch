@@ -8,6 +8,7 @@ This module implements the categorical noise distribution exactly as in DiffUCO:
 Reference: DIffUCO/NoiseDistributions/BaseNoise.py, CategoricalNoise.py
 """
 
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -229,15 +230,13 @@ class GaussianNoiseSchedule:
     Reference: DIffUCO/NoiseDistributions/GaussianNoise.py
     """
 
-    def __init__(self, n_steps: int, continuous_dim: int = 2, schedule: str = 'diffuco'):
+    def __init__(self, n_steps: int, schedule: str = 'diffuco', **kwargs):
         """
         Args:
             n_steps: Number of diffusion steps T
-            continuous_dim: Dimension of continuous state (2 for x,y positions)
             schedule: 'diffuco' for 1/(T-t+1) schedule
         """
         self.n_steps = n_steps
-        self.continuous_dim = continuous_dim
         self.schedule = schedule
 
         # Compute gamma schedule (same base schedule as categorical)
@@ -327,7 +326,7 @@ class GaussianNoiseSchedule:
 
         # Gaussian log probability per dimension
         diff = X_next - mean
-        log_prob_per_dim = -0.5 * (diff ** 2 / var + torch.log(2 * np.pi * var))
+        log_prob_per_dim = -0.5 * (diff ** 2 / var + torch.log(torch.tensor(2.0 * math.pi) * var))
 
         # Sum over continuous dimensions → per-component log prob
         log_prob_per_component = log_prob_per_dim.sum(dim=-1)
