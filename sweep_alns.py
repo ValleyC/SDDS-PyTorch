@@ -497,19 +497,19 @@ def print_summary(results, circuits):
     # Compute mean ratio_vs_ref per config (across circuits and seeds)
     config_scores = []
     for ck, runs in by_config.items():
-        ratios = [r['ratio_vs_ref'] for r in runs]
+        ratios = [float(r['ratio_vs_ref']) for r in runs]
         mean_ratio = np.mean(ratios)
         std_ratio = np.std(ratios)
-        mean_iters = np.mean([r['n_iterations'] for r in runs])
-        mean_infeas = np.mean([r['n_infeasible'] for r in runs])
-        mean_improved = np.mean([r['n_improved'] for r in runs])
+        mean_iters = np.mean([float(r['n_iterations']) for r in runs])
+        mean_infeas = np.mean([float(r['n_infeasible']) for r in runs])
+        mean_improved = np.mean([float(r['n_improved']) for r in runs])
 
         # Per-circuit mean ratio
         per_circuit = {}
         for c in circuits:
             c_runs = [r for r in runs if r['circuit'] == c]
             if c_runs:
-                per_circuit[c] = np.mean([r['ratio_vs_ref'] for r in c_runs])
+                per_circuit[c] = np.mean([float(r['ratio_vs_ref']) for r in c_runs])
 
         config_scores.append({
             'config_key': ck,
