@@ -306,9 +306,57 @@ def config_key(config):
     return '_'.join(parts)
 
 
+def _sweep_worker(args):
+    """Module-level worker for ProcessPoolExecutor (must be picklable)."""
+    config, circuit_name, circuit_data, seed, wall_clock = args
+    result = run_lns_wallclock(
+        positions=circuit_data['legal_positions'],
+        sizes=circuit_data['sizes'],
+        nets=circuit_data['nets'],
+        edge_index=circuit_data['edge_index'],
+        subset_size=config['subset_size'],
+        window_fraction=config['window_fraction'],
+        cpsat_time_limit=config['cpsat_time_limit'],
+        congestion_weight=config.get('congestion_weight', 0.0),
+        plateau_threshold=config.get('plateau_threshold', 20),
+        adapt_threshold=config.get('adapt_threshold', 30),
+        adaptive=config.get('adaptive', True),
+        wall_clock=wall_clock,
+        seed=seed,
+    )
+    ck = config_key(config)
+    return {
+        'config_key': ck,
+        'config': config,
+        'circuit': circuit_name,
+        'seed': seed,
+        'N': circuit_data['N'],
+        'ref_hpwl': circuit_data['ref_hpwl'],
+        'legal_hpwl': circuit_data['legal_hpwl'],
+        'best_hpwl': result['best_hpwl'],
+        'ratio_vs_ref': result['best_hpwl'] / max(float(circuit_data['ref_hpwl']), 1e-8),
+        'ratio_vs_legal': result['best_hpwl'] / max(float(circuit_data['legal_hpwl']), 1e-8),
+        'n_iterations': result['n_iterations'],
+        'n_accepted': result['n_accepted'],
+        'n_improved': result['n_improved'],
+        'n_infeasible': result['n_infeasible'],
+        'overlap_pairs': result['overlap_pairs'],
+        'overlap_area': result['overlap_area'],
+        'boundary': result['boundary'],
+        'elapsed_s': result['elapsed_s'],
+        'improvement_per_second': result['improvement_per_second'],
+        'anytime_hpwl_10s': _anytime_at(result['anytime_curve'], 10),
+        'anytime_hpwl_30s': _anytime_at(result['anytime_curve'], 30),
+        'anytime_hpwl_60s': _anytime_at(result['anytime_curve'], 60),
+        'anytime_hpwl_120s': _anytime_at(result['anytime_curve'], 120),
+        'anytime_hpwl_300s': _anytime_at(result['anytime_curve'], 300),
+        'strategy_stats': result['strategy_stats'],
+    }
+
+
 def run_sweep(
     configs, circuits, seeds, wall_clock, benchmark_base,
-    legalize_time_limit, legalize_window, save_dir,
+    legalize_time_limit, legalize_window, save_dir, n_workers=1,
 ):
     """Run full parameter sweep."""
     os.makedirs(save_dir, exist_ok=True)
@@ -366,90 +414,57 @@ def run_sweep(
         completed_keys.add(k)
 
     total_runs = len(configs) * len(circuits) * len(seeds)
-    skipped = 0
-    run_idx = 0
 
     print(f"\n{'='*70}")
     print(f"Sweep: {len(configs)} configs x {len(circuits)} circuits x {len(seeds)} seeds = {total_runs} runs")
-    print(f"Wall clock per run: {wall_clock}s")
-    print(f"Estimated total time: {total_runs * wall_clock / 3600:.1f}h (upper bound)")
+    print(f"Wall clock per run: {wall_clock}s | workers: {n_workers}")
+    est_h = total_runs * wall_clock / max(n_workers, 1) / 3600
+    print(f"Estimated total time: {est_h:.1f}h")
     print(f"{'='*70}\n")
 
-    for ci, config in enumerate(configs):
+    # Build pending job list (skip already-completed)
+    pending_jobs = []
+    for config in configs:
         ck = config_key(config)
-
         for circuit_name in circuits:
             cdata = circuit_cache[circuit_name]
-
             for seed in seeds:
-                run_idx += 1
-                k = (ck, circuit_name, seed)
+                if (ck, circuit_name, seed) not in completed_keys:
+                    pending_jobs.append((config, circuit_name, cdata, seed, wall_clock))
 
-                if k in completed_keys:
-                    skipped += 1
-                    continue
-
-                print(f"[{run_idx}/{total_runs}] {ck} | {circuit_name} | seed={seed} ...", end=' ', flush=True)
-
-                result = run_lns_wallclock(
-                    positions=cdata['legal_positions'],
-                    sizes=cdata['sizes'],
-                    nets=cdata['nets'],
-                    edge_index=cdata['edge_index'],
-                    subset_size=config['subset_size'],
-                    window_fraction=config['window_fraction'],
-                    cpsat_time_limit=config['cpsat_time_limit'],
-                    congestion_weight=config.get('congestion_weight', 0.0),
-                    plateau_threshold=config.get('plateau_threshold', 20),
-                    adapt_threshold=config.get('adapt_threshold', 30),
-                    adaptive=config.get('adaptive', True),
-                    wall_clock=wall_clock,
-                    seed=seed,
-                )
-
-                # Record
-                entry = {
-                    'config_key': ck,
-                    'config': config,
-                    'circuit': circuit_name,
-                    'seed': seed,
-                    'N': cdata['N'],
-                    'ref_hpwl': cdata['ref_hpwl'],
-                    'legal_hpwl': cdata['legal_hpwl'],
-                    'best_hpwl': result['best_hpwl'],
-                    'ratio_vs_ref': result['best_hpwl'] / max(cdata['ref_hpwl'], 1e-8),
-                    'ratio_vs_legal': result['best_hpwl'] / max(cdata['legal_hpwl'], 1e-8),
-                    'n_iterations': result['n_iterations'],
-                    'n_accepted': result['n_accepted'],
-                    'n_improved': result['n_improved'],
-                    'n_infeasible': result['n_infeasible'],
-                    'overlap_pairs': result['overlap_pairs'],
-                    'overlap_area': result['overlap_area'],
-                    'boundary': result['boundary'],
-                    'elapsed_s': result['elapsed_s'],
-                    'improvement_per_second': result['improvement_per_second'],
-                    'anytime_hpwl_10s': _anytime_at(result['anytime_curve'], 10),
-                    'anytime_hpwl_30s': _anytime_at(result['anytime_curve'], 30),
-                    'anytime_hpwl_60s': _anytime_at(result['anytime_curve'], 60),
-                    'anytime_hpwl_120s': _anytime_at(result['anytime_curve'], 120),
-                    'anytime_hpwl_300s': _anytime_at(result['anytime_curve'], 300),
-                    'strategy_stats': result['strategy_stats'],
-                }
-
-                all_results.append(entry)
-
-                ratio = entry['ratio_vs_ref']
-                print(f"HPWL={result['best_hpwl']:.2f} ({ratio:.3f}x ref) "
-                      f"iters={result['n_iterations']} "
-                      f"improved={result['n_improved']} "
-                      f"infeas={result['n_infeasible']}")
-
-                # Save after each run (crash-safe)
-                with open(results_path, 'w') as f:
-                    json.dump(all_results, f, indent=2, default=str)
-
+    skipped = total_runs - len(completed_keys) - len(pending_jobs)
+    if len(completed_keys) > 0:
+        print(f"Resuming: {len(completed_keys)} done, {len(pending_jobs)} remaining")
     if skipped > 0:
-        print(f"\nSkipped {skipped} already-completed runs")
+        print(f"Skipped {skipped} duplicate entries")
+
+    completed_count = len(all_results)
+
+    def _save_entry(entry):
+        nonlocal completed_count
+        completed_count += 1
+        ratio = entry['ratio_vs_ref']
+        print(f"[{completed_count}/{total_runs}] {entry['config_key']} | {entry['circuit']} | "
+              f"seed={entry['seed']}  HPWL={entry['best_hpwl']:.2f} ({ratio:.3f}x ref) "
+              f"iters={entry['n_iterations']} improved={entry['n_improved']} "
+              f"infeas={entry['n_infeasible']}", flush=True)
+        all_results.append(entry)
+        with open(results_path, 'w') as f:
+            json.dump(all_results, f, indent=2, default=str)
+
+    if n_workers == 1:
+        for job in pending_jobs:
+            _save_entry(_sweep_worker(job))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_sweep_worker, job): job for job in pending_jobs}
+            for future in as_completed(futures):
+                try:
+                    _save_entry(future.result())
+                except Exception as e:
+                    job = futures[future]
+                    print(f"  ERROR {config_key(job[0])} | {job[1]} | seed={job[3]}: {e}")
 
     # Print summary
     print_summary(all_results, circuits)
@@ -582,6 +597,11 @@ def main():
     parser.add_argument('--base_window_fraction', type=float, default=None)
     parser.add_argument('--base_cpsat_time_limit', type=float, default=None)
 
+    # Parallelism
+    parser.add_argument('--n_workers', type=int, default=1,
+                        help='Parallel sweep workers (each uses 4 CP-SAT threads; '
+                             'keep n_workers * 4 <= total cores)')
+
     args = parser.parse_args()
 
     circuits = args.circuits or (TRAIN_CIRCUITS if args.train_only else ALL_CIRCUITS)
@@ -686,6 +706,7 @@ def main():
         legalize_time_limit=args.legalize_time_limit,
         legalize_window=args.legalize_window,
         save_dir=phase_dir,
+        n_workers=args.n_workers,
     )
 
 
